@@ -60,7 +60,7 @@ class TuyaNodeCameraEntity(Camera):
         self._device = device
         self._manager = manager
         self._restart_task: asyncio.Task | None = None
-            self._last_source: str | None = None
+        self._last_source: str | None = None
         self._attr_unique_id = f"tuya_node_bridge_{device.id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device.id)},
@@ -87,32 +87,35 @@ class TuyaNodeCameraEntity(Camera):
         """Periodically restart RTSP stream to get fresh Tuya URL before expiry."""
         while True:
             await asyncio.sleep(_STREAM_RESTART_SECONDS)
-                try:
-                    # Access HA's stream component and stop the active stream for this camera
-                    if "stream" in self.hass.components:
-                        from homeassistant.components import stream as stream_component
+            try:
+                # Access HA's stream component and stop the active stream for this camera.
+                if "stream" in self.hass.components:
+                    from homeassistant.components import stream as stream_component
 
-                        # Find and stop this camera's active stream
-                        for stream in list(stream_component.STREAMS.values()):
-                            if stream.source == self._last_source and stream.state == stream_component.StreamState.RUNNING:
-                                LOGGER.debug(
-                                    "Stopping RTSP stream for %s to refresh Tuya URL",
-                                    self._device.id,
-                                )
-                                await stream.async_close()
-                except Exception as err:  # noqa: BLE001
-                    LOGGER.debug("Error restarting stream for %s: %s", self._device.id, err)
+                    # Find and stop this camera's active stream.
+                    for stream in list(stream_component.STREAMS.values()):
+                        if (
+                            stream.source == self._last_source
+                            and stream.state == stream_component.StreamState.RUNNING
+                        ):
+                            LOGGER.debug(
+                                "Stopping RTSP stream for %s to refresh Tuya URL",
+                                self._device.id,
+                            )
+                            await stream.async_close()
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("Error restarting stream for %s: %s", self._device.id, err)
 
     async def stream_source(self) -> str | None:
         """Return the source of the RTSP stream."""
         try:
-                source = await self.hass.async_add_executor_job(
+            source = await self.hass.async_add_executor_job(
                 self._manager.get_device_stream_allocate,
                 self._device.id,
                 "rtsp",
             )
-                self._last_source = source
-                return source
+            self._last_source = source
+            return source
         except Exception as err:  # noqa: BLE001
             LOGGER.warning("Failed to allocate RTSP stream for %s: %s", self._device.id, err)
             return None
