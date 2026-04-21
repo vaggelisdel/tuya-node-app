@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from tuya_sharing import CustomerDevice, Manager
 
 from homeassistant.components import ffmpeg
@@ -17,8 +15,6 @@ from .const import DOMAIN, LOGGER, TUYA_DISCOVERY_NEW
 from .coordinator import TuyaNodeConfigEntry
 
 CAMERA_CATEGORIES = {"sp", "dghsxj"}
-# Tuya RTSP URLs expire after ~2.5 minutes; restart stream before expiry
-_STREAM_REFRESH_SECONDS = 110
 
 
 async def async_setup_entry(
@@ -59,7 +55,6 @@ class TuyaNodeCameraEntity(Camera):
         super().__init__()
         self._device = device
         self._manager = manager
-        self._stream_refresh_task: asyncio.Task | None = None
         self._attr_unique_id = f"tuya_node_bridge_{device.id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device.id)},
@@ -69,37 +64,17 @@ class TuyaNodeCameraEntity(Camera):
             model_id=device.product_id,
         )
 
-    async def async_added_to_hass(self) -> None:
-        """Start stream refresh watchdog when entity is added."""
-        await super().async_added_to_hass()
-        self._stream_refresh_task = self.hass.async_create_task(
-            self._stream_refresh_loop(), eager_start=False
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Cancel stream refresh watchdog on removal."""
-        if self._stream_refresh_task:
-            self._stream_refresh_task.cancel()
-            self._stream_refresh_task = None
-
-    async def _stream_refresh_loop(self) -> None:
-        """Periodically stop the stream so HA requests a fresh Tuya URL."""
-        while True:
-            await asyncio.sleep(_STREAM_REFRESH_SECONDS)
-            if self.stream is not None:
-                LOGGER.debug(
-                    "Forcing stream restart for %s to refresh Tuya RTSP URL",
-                    self._device.id,
-                )
-                await self.stream.stop()
-
     async def stream_source(self) -> str | None:
-        """Return the source of the stream."""
-        return await self.hass.async_add_executor_job(
-            self._manager.get_device_stream_allocate,
-            self._device.id,
-            "rtsp",
-        )
+        """Return the source of the stream (HLS for auto-reconnect on stall)."""
+        try:
+            return await self.hass.async_add_executor_job(
+                self._manager.get_device_stream_allocate,
+                self._device.id,
+                "hls",
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.warning("Failed to allocate HLS stream for %s: %s", self._device.id, err)
+            return None
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
