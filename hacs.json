@@ -1,6 +1,9 @@
 {
-  "name": "Tuya Camera Card",
+  "name": "Tuya Node Bridge",
   "content_in_root": true,
-  "filename": "tuya-camera-card.js",
-  "render_readme": true
+  "render_readme": true,
+  "domains": [
+    "tuya_node_bridge"
+  ],
+  "homeassistant": "2024.1.0"
 }
