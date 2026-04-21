@@ -17,8 +17,8 @@ from .const import DOMAIN, LOGGER, TUYA_DISCOVERY_NEW
 from .coordinator import TuyaNodeConfigEntry
 
 CAMERA_CATEGORIES = {"sp", "dghsxj"}
-# Tuya RTSP URLs expire after ~2.5 minutes; restart stream before expiry
-_STREAM_RESTART_SECONDS = 100
+# Tuya RTSP URLs expire around 2.5 minutes; rotate source before expiry.
+_STREAM_RESTART_SECONDS = 90
 
 
 async def async_setup_entry(
@@ -84,27 +84,30 @@ class TuyaNodeCameraEntity(Camera):
             self._restart_task = None
 
     async def _stream_restart_loop(self) -> None:
-        """Periodically restart RTSP stream to get fresh Tuya URL before expiry."""
+        """Periodically refresh RTSP source URL and hot-swap stream input."""
         while True:
             await asyncio.sleep(_STREAM_RESTART_SECONDS)
             try:
-                # Access HA's stream component and stop the active stream for this camera.
-                if "stream" in self.hass.components:
-                    from homeassistant.components import stream as stream_component
+                if self.stream is None:
+                    continue
 
-                    # Find and stop this camera's active stream.
-                    for stream in list(stream_component.STREAMS.values()):
-                        if (
-                            stream.source == self._last_source
-                            and stream.state == stream_component.StreamState.RUNNING
-                        ):
-                            LOGGER.debug(
-                                "Stopping RTSP stream for %s to refresh Tuya URL",
-                                self._device.id,
-                            )
-                            await stream.async_close()
+                new_source = await self.hass.async_add_executor_job(
+                    self._manager.get_device_stream_allocate,
+                    self._device.id,
+                    "rtsp",
+                )
+                if not new_source:
+                    continue
+
+                if new_source != self._last_source:
+                    LOGGER.debug(
+                        "Updating RTSP source for %s before token expiry",
+                        self._device.id,
+                    )
+                    self.stream.update_source(new_source)
+                    self._last_source = new_source
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("Error restarting stream for %s: %s", self._device.id, err)
+                LOGGER.debug("Error refreshing stream for %s: %s", self._device.id, err)
 
     async def stream_source(self) -> str | None:
         """Return the source of the RTSP stream."""
