@@ -3,27 +3,21 @@
     "step": {
       "user": {
         "title": "Tuya Node Bridge",
-        "description": "Connect Home Assistant directly to Tuya using QR login.",
+        "description": "Enter your Tuya User Code to begin QR login.",
         "data": {
-          "user_code": "Tuya User Code"
+          "user_code": "User Code"
         }
       },
       "scan": {
-        "title": "Scan Tuya QR",
-        "description": "Open this deep link on your phone (or generate a QR from it), scan/approve in Tuya Smart or Smart Life, then submit.\\n\\nDeep link: {qr_code_url}",
-        "data": {
-          "confirm": "I scanned the QR code"
-        }
+        "title": "Scan QR Code",
+        "description": "Scan the QR code below with Tuya Smart or Smart Life app, then click Submit."
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to Tuya cloud",
-      "invalid_qr": "Could not generate QR code",
-      "login_failed": "Tuya login not completed yet",
-      "unknown": "Unexpected error"
+      "login_error": "Login failed: {msg} (code: {code})"
     },
     "abort": {
-      "already_configured": "This server is already configured"
+      "already_configured": "This account is already configured"
     }
   }
 }

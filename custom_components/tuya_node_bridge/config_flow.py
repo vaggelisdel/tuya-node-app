@@ -1,124 +1,153 @@
+"""Config flow for Tuya Node Bridge."""
+
 from __future__ import annotations
 
 from typing import Any
 
-import aiohttp
+from tuya_sharing import LoginControl
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.helpers import selector
 
 from .const import (
     CONF_ENDPOINT,
     CONF_TERMINAL_ID,
     CONF_TOKEN_INFO,
     CONF_USER_CODE,
-    DEFAULT_NAME,
     DOMAIN,
+    TUYA_CLIENT_ID,
+    TUYA_RESPONSE_CODE,
+    TUYA_RESPONSE_MSG,
+    TUYA_RESPONSE_QR_CODE,
+    TUYA_RESPONSE_RESULT,
+    TUYA_RESPONSE_SUCCESS,
+    TUYA_SCHEMA,
 )
-from .tuya_cloud import TuyaCloudApi, TuyaLoginApi
 
 
-class TuyaNodeBridgeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class TuyaNodeBridgeConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Tuya Node Bridge config flow."""
+
     VERSION = 1
 
+    __user_code: str
+    __qr_code: str
+
     def __init__(self) -> None:
-        self._user_code: str | None = None
-        self._token: str | None = None
-        self._qr_code_url: str | None = None
+        """Initialize the config flow."""
+        self.__login_control = LoginControl()
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step user."""
         errors: dict[str, str] = {}
+        placeholders: dict[str, str] = {}
 
         if user_input is not None:
-            user_code = user_input[CONF_USER_CODE].strip()
+            success, response = await self.__async_get_qr_code(
+                user_input[CONF_USER_CODE]
+            )
+            if success:
+                return await self.async_step_scan()
 
-            session = async_get_clientsession(self.hass)
-            login_api = TuyaLoginApi(session)
-
-            try:
-                payload = await login_api.async_create_qr(user_code)
-                token = payload.get("result", {}).get("qrcode")
-                if not payload.get("success") or not token:
-                    errors["base"] = "invalid_qr"
-                else:
-                    self._user_code = user_code
-                    self._token = token
-                    self._qr_code_url = f"tuyaSmart--qrLogin?token={token}"
-                    return await self.async_step_scan()
-            except (aiohttp.ClientError, TimeoutError):
-                errors["base"] = "cannot_connect"
-            except Exception:  # noqa: BLE001
-                errors["base"] = "unknown"
-
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_USER_CODE): str,
+            errors["base"] = "login_error"
+            placeholders = {
+                TUYA_RESPONSE_MSG: response.get(TUYA_RESPONSE_MSG, "Unknown error"),
+                TUYA_RESPONSE_CODE: response.get(TUYA_RESPONSE_CODE, "0"),
             }
-        )
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+        else:
+            user_input = {}
 
-    async def async_step_scan(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            session = async_get_clientsession(self.hass)
-            login_api = TuyaLoginApi(session)
-            try:
-                payload = await login_api.async_login_result(self._token or "", self._user_code or "")
-                if not payload.get("success"):
-                    errors["base"] = "login_failed"
-                else:
-                    result = payload.get("result", {})
-                    token_info = {
-                        "t": payload.get("t"),
-                        "uid": result.get("uid"),
-                        "expire_time": result.get("expire_time"),
-                        "access_token": result.get("access_token"),
-                        "refresh_token": result.get("refresh_token"),
-                    }
-                    endpoint = result.get("endpoint")
-                    terminal_id = result.get("terminal_id")
-
-                    if not endpoint or not terminal_id:
-                        errors["base"] = "login_failed"
-                    else:
-                        unique = f"{result.get('uid')}::{terminal_id}"
-                        await self.async_set_unique_id(unique)
-                        self._abort_if_unique_id_configured()
-
-                        # Validate with one cloud request before creating the entry.
-                        cloud = TuyaCloudApi(
-                            session=session,
-                            user_code=self._user_code or "",
-                            endpoint=endpoint,
-                            token_info=token_info,
-                            token_update_cb=lambda _: None,
-                        )
-                        await cloud.async_query_devices()
-
-                        title = result.get("username") or DEFAULT_NAME
-                        return self.async_create_entry(
-                            title=title,
-                            data={
-                                CONF_USER_CODE: self._user_code,
-                                CONF_TERMINAL_ID: terminal_id,
-                                CONF_ENDPOINT: endpoint,
-                                CONF_TOKEN_INFO: token_info,
-                            },
-                        )
-            except (aiohttp.ClientError, TimeoutError):
-                errors["base"] = "cannot_connect"
-            except Exception:  # noqa: BLE001
-                errors["base"] = "unknown"
-
-        schema = vol.Schema({vol.Required("confirm", default=True): bool})
         return self.async_show_form(
-            step_id="scan",
-            data_schema=schema,
+            step_id="user",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_USER_CODE, default=user_input.get(CONF_USER_CODE, "")
+                    ): str,
+                }
+            ),
             errors=errors,
-            description_placeholders={
-                "qr_code_url": self._qr_code_url or "",
+            description_placeholders=placeholders,
+        )
+
+    async def async_step_scan(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Step scan."""
+        if user_input is None:
+            return self.async_show_form(
+                step_id="scan",
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional("QR"): selector.QrCodeSelector(
+                            config=selector.QrCodeSelectorConfig(
+                                data=f"tuyaSmart--qrLogin?token={self.__qr_code}",
+                                scale=5,
+                                error_correction_level=selector.QrErrorCorrectionLevel.QUARTILE,
+                            )
+                        )
+                    }
+                ),
+            )
+
+        ret, info = await self.hass.async_add_executor_job(
+            self.__login_control.login_result,
+            self.__qr_code,
+            TUYA_CLIENT_ID,
+            self.__user_code,
+        )
+        if not ret:
+            await self.__async_get_qr_code(self.__user_code)
+            return self.async_show_form(
+                step_id="scan",
+                errors={"base": "login_error"},
+                data_schema=vol.Schema(
+                    {
+                        vol.Optional("QR"): selector.QrCodeSelector(
+                            config=selector.QrCodeSelectorConfig(
+                                data=f"tuyaSmart--qrLogin?token={self.__qr_code}",
+                                scale=5,
+                                error_correction_level=selector.QrErrorCorrectionLevel.QUARTILE,
+                            )
+                        )
+                    }
+                ),
+                description_placeholders={
+                    TUYA_RESPONSE_MSG: info.get(TUYA_RESPONSE_MSG, "Unknown error"),
+                    TUYA_RESPONSE_CODE: info.get(TUYA_RESPONSE_CODE, 0),
+                },
+            )
+
+        return self.async_create_entry(
+            title=info.get("username"),
+            data={
+                CONF_USER_CODE: self.__user_code,
+                CONF_TOKEN_INFO: {
+                    "t": info["t"],
+                    "uid": info["uid"],
+                    "expire_time": info["expire_time"],
+                    "access_token": info["access_token"],
+                    "refresh_token": info["refresh_token"],
+                },
+                CONF_TERMINAL_ID: info[CONF_TERMINAL_ID],
+                CONF_ENDPOINT: info[CONF_ENDPOINT],
             },
         )
+
+    async def __async_get_qr_code(
+        self, user_code: str
+    ) -> tuple[bool, dict[str, Any]]:
+        """Get the QR code."""
+        response = await self.hass.async_add_executor_job(
+            self.__login_control.qr_code,
+            TUYA_CLIENT_ID,
+            TUYA_SCHEMA,
+            user_code,
+        )
+        if success := response.get(TUYA_RESPONSE_SUCCESS, False):
+            self.__user_code = user_code
+            self.__qr_code = response[TUYA_RESPONSE_RESULT][TUYA_RESPONSE_QR_CODE]
+        return success, response
