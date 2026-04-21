@@ -1,0 +1,6 @@
+{
+  "name": "Tuya Camera Card",
+  "content_in_root": true,
+  "filename": "tuya-camera-card.js",
+  "render_readme": true
+}

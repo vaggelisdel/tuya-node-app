@@ -1,0 +1,4 @@
+node_modules/
+.stream-segments/
+.venv/
+tuya-session.json

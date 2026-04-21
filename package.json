@@ -1,0 +1,25 @@
+{
+  "name": "tuya-node-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js port of the Tuya Home Assistant sharing flow",
+  "bin": {
+    "tuya-node-app": "./src/cli.js"
+  },
+  "scripts": {
+    "check": "node --check src/*.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "qrcode": "^1.5.4"
+  },
+  "optionalDependencies": {
+    "mqtt": "^5.10.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
