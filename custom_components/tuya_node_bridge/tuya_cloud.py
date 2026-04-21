@@ -115,6 +115,17 @@ class TuyaLoginApi:
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
 
+  async def _read_json(self, response: aiohttp.ClientResponse) -> dict[str, Any]:
+      try:
+          return await response.json(content_type=None)
+      except Exception:  # noqa: BLE001
+          text = await response.text()
+          return {
+              "success": False,
+              "code": f"HTTP_{response.status}",
+              "msg": text or "Unexpected response from Tuya login endpoint",
+          }
+
     async def async_create_qr(self, user_code: str) -> dict[str, Any]:
         params = {
             "clientid": TUYA_CLIENT_ID,
@@ -126,8 +137,16 @@ class TuyaLoginApi:
             params=params,
             timeout=REQUEST_TIMEOUT,
         ) as response:
-            response.raise_for_status()
-            return await response.json()
+            payload = await self._read_json(response)
+            if response.status >= 500:
+                raise aiohttp.ClientResponseError(
+                    request_info=response.request_info,
+                    history=response.history,
+                    status=response.status,
+                    message="Tuya login server error",
+                    headers=response.headers,
+                )
+            return payload
 
     async def async_login_result(self, token: str, user_code: str) -> dict[str, Any]:
         params = {
@@ -139,8 +158,16 @@ class TuyaLoginApi:
             params=params,
             timeout=REQUEST_TIMEOUT,
         ) as response:
-            response.raise_for_status()
-            return await response.json()
+            payload = await self._read_json(response)
+            if response.status >= 500:
+                raise aiohttp.ClientResponseError(
+                    request_info=response.request_info,
+                    history=response.history,
+                    status=response.status,
+                    message="Tuya login server error",
+                    headers=response.headers,
+                )
+            return payload
 
 
 class TuyaCloudApi:
