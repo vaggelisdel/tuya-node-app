@@ -7,7 +7,7 @@ class TuyaReconnectCameraCard extends HTMLElement {
       fit_mode: "cover",
       watchdog_interval: 3,
       frozen_checks: 3,
-      refresh_seconds: 100,
+      refresh_seconds: 75,
       reconnect_delay: 1,
     };
   }
@@ -21,7 +21,7 @@ class TuyaReconnectCameraCard extends HTMLElement {
       fit_mode: "cover",
       watchdog_interval: 3,
       frozen_checks: 3,
-      refresh_seconds: 100,
+      refresh_seconds: 75,
       reconnect_delay: 1,
       ...config,
     };
@@ -46,7 +46,11 @@ class TuyaReconnectCameraCard extends HTMLElement {
 
     const state = hass.states[this._config.entity];
     const available = Boolean(state) && state.state !== "unavailable";
-    this._setState(available ? "live" : "offline");
+    if (!available) {
+      this._setState("offline", "offline");
+      this._stop();
+      return;
+    }
 
     if (available && !this._running) {
       this._restart();
@@ -129,12 +133,17 @@ class TuyaReconnectCameraCard extends HTMLElement {
     this._titleEl = this._card.querySelector(".title");
     this._img = this._card.querySelector("img");
     this._statusEl = this._card.querySelector(".status");
+    this._bindImgEvents(this._img);
 
-    this._img.addEventListener("error", () => {
+    this.appendChild(this._card);
+  }
+
+  _bindImgEvents(img) {
+    img.addEventListener("error", () => {
       this._scheduleReconnect("load error");
     });
 
-    this._img.addEventListener("load", () => {
+    img.addEventListener("load", () => {
       if (!this._running) {
         return;
       }
@@ -142,8 +151,20 @@ class TuyaReconnectCameraCard extends HTMLElement {
       this._startWatchdog();
       this._startPeriodicRefresh();
     });
+  }
 
-    this.appendChild(this._card);
+  _replaceImageElement() {
+    const oldImg = this._img;
+    if (!oldImg || !oldImg.parentNode) {
+      return;
+    }
+
+    const newImg = document.createElement("img");
+    newImg.alt = oldImg.alt || "camera stream";
+    newImg.style.objectFit = this._config.fit_mode;
+    this._bindImgEvents(newImg);
+    oldImg.parentNode.replaceChild(newImg, oldImg);
+    this._img = newImg;
   }
 
   _restart() {
@@ -167,6 +188,8 @@ class TuyaReconnectCameraCard extends HTMLElement {
     this._refreshTimer = null;
     this._lastPixels = null;
     this._frozenCount = 0;
+    clearTimeout(this._warmupTimer);
+    this._warmupTimer = null;
     if (this._img) {
       this._img.removeAttribute("src");
     }
@@ -186,7 +209,12 @@ class TuyaReconnectCameraCard extends HTMLElement {
 
     // Use relative API path (official frontend behavior) so it works both
     // on local network and when accessed remotely via HA Cloud/reverse proxy.
-    return path + "?token=" + encodeURIComponent(token) + "&ts=" + Date.now();
+    return (
+      path +
+      "?token=" + encodeURIComponent(token) +
+      "&ts=" + Date.now() +
+      "&r=" + Math.random().toString(36).slice(2)
+    );
   }
 
   _startStream() {
@@ -201,6 +229,8 @@ class TuyaReconnectCameraCard extends HTMLElement {
     }
 
     this._setState("reconnecting", "reconnecting");
+    // Force browser to drop old multipart connection before setting a new src.
+    this._replaceImageElement();
     this._img.src = url;
 
     clearTimeout(this._warmupTimer);
