@@ -134,6 +134,15 @@ class TuyaReconnectCameraCard extends HTMLElement {
       this._scheduleReconnect("load error");
     });
 
+    this._img.addEventListener("load", () => {
+      if (!this._running) {
+        return;
+      }
+      this._setState("live", "live");
+      this._startWatchdog();
+      this._startPeriodicRefresh();
+    });
+
     this.appendChild(this._card);
   }
 
@@ -170,12 +179,14 @@ class TuyaReconnectCameraCard extends HTMLElement {
     }
 
     const token = state.attributes && state.attributes.access_token;
+    const path = "/api/camera_proxy_stream/" + this._config.entity;
     if (!token) {
-      return null;
+      return path + "?ts=" + Date.now();
     }
 
-    const path = "/api/camera_proxy_stream/" + this._config.entity + "?token=" + token + "&ts=" + Date.now();
-    return this._hass.hassUrl(path);
+    // Use relative API path (official frontend behavior) so it works both
+    // on local network and when accessed remotely via HA Cloud/reverse proxy.
+    return path + "?token=" + encodeURIComponent(token) + "&ts=" + Date.now();
   }
 
   _startStream() {
@@ -197,7 +208,9 @@ class TuyaReconnectCameraCard extends HTMLElement {
       if (!this._running) {
         return;
       }
-      this._setState("live", "live");
+      // If load didn't fire, start watchdog anyway so frozen/no-frame streams
+      // can still recover automatically.
+      this._setState("reconnecting", "waiting frames");
       this._startWatchdog();
       this._startPeriodicRefresh();
     }, 1500);
