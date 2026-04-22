@@ -39,11 +39,12 @@ async def async_setup_entry(
     @callback
     def async_discover_device(device_ids: list[str]) -> None:
         """Discover and add a discovered Tuya camera."""
-        entities: list[TuyaNodeCameraEntity] = []
+        entities: list[Camera] = []
         for device_id in device_ids:
             device = manager.device_map[device_id]
             if device.category in CAMERA_CATEGORIES:
                 entities.append(TuyaNodeCameraEntity(device, manager))
+                entities.append(TuyaNodeLowLatencyCameraEntity(device, manager))
         async_add_entities(entities)
 
     async_discover_device([*manager.device_map])
@@ -56,9 +57,7 @@ async def async_setup_entry(
 class TuyaNodeCameraEntity(Camera):
     """Tuya Node Bridge Camera Entity."""
 
-    # Deliberately avoid HA's stream pipeline so the frontend falls back to
-    # MJPEG via /api/camera_proxy_stream, which we can watchdog and reconnect.
-    _attr_supported_features = CameraEntityFeature(0)
+    _attr_supported_features = CameraEntityFeature.STREAM
     _attr_brand = "Tuya"
     _attr_name = None
     _attr_has_entity_name = True
@@ -88,6 +87,31 @@ class TuyaNodeCameraEntity(Camera):
         except Exception as err:  # noqa: BLE001
             LOGGER.warning("Failed to allocate RTSP stream for %s: %s", self._device.id, err)
             return None
+
+    async def stream_source(self) -> str | None:
+        """Return the RTSP source for HA's standard stream pipeline."""
+        return await self._async_get_rtsp_source()
+
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
+        """Return a still image response from the camera."""
+        stream_source = await self._async_get_rtsp_source()
+        if not stream_source:
+            return None
+        return await ffmpeg.async_get_image(
+            self.hass,
+            stream_source,
+            width=width,
+            height=height,
+        )
+
+
+class TuyaNodeLowLatencyCameraEntity(TuyaNodeCameraEntity):
+    """Low-latency MJPEG camera entity with watchdog reconnect."""
+
+    _attr_supported_features = CameraEntityFeature(0)
+    _attr_name = "Low latency"
 
     async def handle_async_mjpeg_stream(
         self, request: web.Request
@@ -144,6 +168,15 @@ class TuyaNodeCameraEntity(Camera):
             await asyncio.sleep(_MJPEG_RECONNECT_DELAY)
 
         return response
+
+    async def stream_source(self) -> str | None:
+        """Disable HA stream pipeline for the low-latency MJPEG entity."""
+        return None
+
+    def __init__(self, device: CustomerDevice, manager: Manager) -> None:
+        """Init low-latency camera entity."""
+        super().__init__(device, manager)
+        self._attr_unique_id = f"tuya_node_bridge_{device.id}_low_latency"
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
