@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+from aiohttp import web
+from haffmpeg.camera import CameraMjpeg
 from tuya_sharing import CustomerDevice, Manager
 
 from homeassistant.components import ffmpeg
@@ -17,8 +19,13 @@ from .const import DOMAIN, LOGGER, TUYA_DISCOVERY_NEW
 from .coordinator import TuyaNodeConfigEntry
 
 CAMERA_CATEGORIES = {"sp", "dghsxj"}
-# Tuya RTSP URLs expire around 2.5 minutes; rotate source before expiry.
-_STREAM_RESTART_SECONDS = 90
+_MJPEG_BUFFER_SIZE = 64 * 1024
+_MJPEG_READ_TIMEOUT = 12
+_MJPEG_RECONNECT_DELAY = 1
+_FFMPEG_MJPEG_EXTRA_CMD = (
+    "-fflags nobuffer -flags low_delay -analyzeduration 0 -probesize 32 "
+    "-r 10 -q:v 5"
+)
 
 
 async def async_setup_entry(
@@ -49,7 +56,9 @@ async def async_setup_entry(
 class TuyaNodeCameraEntity(Camera):
     """Tuya Node Bridge Camera Entity."""
 
-    _attr_supported_features = CameraEntityFeature.STREAM
+    # Deliberately avoid HA's stream pipeline so the frontend falls back to
+    # MJPEG via /api/camera_proxy_stream, which we can watchdog and reconnect.
+    _attr_supported_features = CameraEntityFeature(0)
     _attr_brand = "Tuya"
     _attr_name = None
     _attr_has_entity_name = True
@@ -59,8 +68,6 @@ class TuyaNodeCameraEntity(Camera):
         super().__init__()
         self._device = device
         self._manager = manager
-        self._restart_task: asyncio.Task | None = None
-        self._last_source: str | None = None
         self._attr_unique_id = f"tuya_node_bridge_{device.id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device.id)},
@@ -70,64 +77,79 @@ class TuyaNodeCameraEntity(Camera):
             model_id=device.product_id,
         )
 
-    async def async_added_to_hass(self) -> None:
-        """Start stream restart task when entity is added."""
-        await super().async_added_to_hass()
-        self._restart_task = self.hass.async_create_task(
-            self._stream_restart_loop(), eager_start=False
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Cancel stream restart task on removal."""
-        if self._restart_task:
-            self._restart_task.cancel()
-            self._restart_task = None
-
-    async def _stream_restart_loop(self) -> None:
-        """Periodically refresh RTSP source URL and hot-swap stream input."""
-        while True:
-            await asyncio.sleep(_STREAM_RESTART_SECONDS)
-            try:
-                if self.stream is None:
-                    continue
-
-                new_source = await self.hass.async_add_executor_job(
-                    self._manager.get_device_stream_allocate,
-                    self._device.id,
-                    "rtsp",
-                )
-                if not new_source:
-                    continue
-
-                if new_source != self._last_source:
-                    LOGGER.debug(
-                        "Updating RTSP source for %s before token expiry",
-                        self._device.id,
-                    )
-                    self.stream.update_source(new_source)
-                    self._last_source = new_source
-            except Exception as err:  # noqa: BLE001
-                LOGGER.debug("Error refreshing stream for %s: %s", self._device.id, err)
-
-    async def stream_source(self) -> str | None:
-        """Return the source of the RTSP stream."""
+    async def _async_get_rtsp_source(self) -> str | None:
+        """Allocate a fresh RTSP source from Tuya."""
         try:
-            source = await self.hass.async_add_executor_job(
+            return await self.hass.async_add_executor_job(
                 self._manager.get_device_stream_allocate,
                 self._device.id,
                 "rtsp",
             )
-            self._last_source = source
-            return source
         except Exception as err:  # noqa: BLE001
             LOGGER.warning("Failed to allocate RTSP stream for %s: %s", self._device.id, err)
             return None
+
+    async def handle_async_mjpeg_stream(
+        self, request: web.Request
+    ) -> web.StreamResponse | None:
+        """Serve a watchdog-backed MJPEG stream with automatic RTSP reconnect."""
+        manager = ffmpeg.get_ffmpeg_manager(self.hass)
+        response = web.StreamResponse()
+        response.content_type = manager.ffmpeg_stream_content_type
+        await response.prepare(request)
+
+        while self.hass.is_running:
+            source = await self._async_get_rtsp_source()
+            if not source:
+                break
+
+            stream = CameraMjpeg(manager.binary)
+            opened = False
+            try:
+                opened = await stream.open_camera(
+                    source,
+                    extra_cmd=_FFMPEG_MJPEG_EXTRA_CMD,
+                )
+                if not opened:
+                    LOGGER.debug("FFmpeg failed to open MJPEG stream for %s", self._device.id)
+                    await asyncio.sleep(_MJPEG_RECONNECT_DELAY)
+                    continue
+
+                LOGGER.debug("Started MJPEG proxy for %s", self._device.id)
+                reader = await stream.get_reader()
+                while self.hass.is_running:
+                    try:
+                        async with asyncio.timeout(_MJPEG_READ_TIMEOUT):
+                            data = await reader.read(_MJPEG_BUFFER_SIZE)
+                    except TimeoutError:
+                        LOGGER.debug(
+                            "MJPEG watchdog timeout for %s, reconnecting",
+                            self._device.id,
+                        )
+                        break
+
+                    if not data:
+                        LOGGER.debug("MJPEG stream ended for %s, reconnecting", self._device.id)
+                        break
+
+                    await response.write(data)
+            except (ConnectionResetError, RuntimeError):
+                return response
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("MJPEG proxy error for %s: %s", self._device.id, err)
+            finally:
+                if opened:
+                    await stream.close()
+
+            await asyncio.sleep(_MJPEG_RECONNECT_DELAY)
+
+        return response
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return a still image response from the camera."""
-        stream_source = await self.stream_source()
+        stream_source = await self._async_get_rtsp_source()
         if not stream_source:
             return None
         return await ffmpeg.async_get_image(
