@@ -5,7 +5,10 @@ class TuyaReconnectCameraCard extends HTMLElement {
       entity: "camera.cateye",
       title: "Tuya Camera",
       fit_mode: "cover",
-      refresh_seconds: 6,
+      watchdog_interval: 3,
+      frozen_checks: 3,
+      refresh_seconds: 75,
+      reconnect_delay: 2,
     };
   }
 
@@ -16,7 +19,10 @@ class TuyaReconnectCameraCard extends HTMLElement {
 
     this._config = {
       fit_mode: "cover",
-      refresh_seconds: 6,
+      watchdog_interval: 3,
+      frozen_checks: 3,
+      refresh_seconds: 75,
+      reconnect_delay: 2,
       ...config,
     };
 
@@ -34,19 +40,18 @@ class TuyaReconnectCameraCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._card) {
-      return;
-    }
+    if (!this._card) return;
 
     const state = hass.states[this._config.entity];
     const available = Boolean(state) && state.state !== "unavailable";
+
     if (!available) {
       this._setState("offline", "offline");
       this._stop();
       return;
     }
 
-    if (available && !this._running) {
+    if (!this._running) {
       this._restart();
     }
   }
@@ -114,98 +119,179 @@ class TuyaReconnectCameraCard extends HTMLElement {
         }
 
         .status.live { border: 1px solid #1db954; }
-        .status.loading { border: 1px solid #f5a524; }
+        .status.reconnecting { border: 1px solid #f5a524; }
         .status.offline { border: 1px solid #e5484d; }
       </style>
       <div class="wrap">
         <div class="title"></div>
-        <img alt="camera" />
-        <div class="status loading">connecting</div>
+        <img alt="camera stream" />
+        <div class="status reconnecting">connecting</div>
       </div>
     `;
 
     this._titleEl = this._card.querySelector(".title");
     this._img = this._card.querySelector("img");
     this._statusEl = this._card.querySelector(".status");
-
-    this._img.addEventListener("load", () => {
-      this._setState("live", "live");
-    });
-
-    this._img.addEventListener("error", () => {
-      this._setState("loading", "retrying");
-    });
-
+    this._bindImgEvents(this._img);
     this.appendChild(this._card);
+  }
+
+  // Bind load/error on a given img element.
+  _bindImgEvents(img) {
+    img.addEventListener("error", () => {
+      this._scheduleReconnect("stream error");
+    });
+
+    img.addEventListener("load", () => {
+      if (!this._running) return;
+      // First frame received — stream is live. Start watchdog + periodic refresh.
+      this._setState("live", "live");
+      this._startWatchdog();
+      this._startPeriodicRefresh();
+    });
+  }
+
+  // Replace the DOM <img> element so the browser is forced to close the old
+  // multipart/x-mixed-replace TCP connection before opening a new one.
+  _replaceImageElement() {
+    const oldImg = this._img;
+    if (!oldImg || !oldImg.parentNode) return;
+
+    const newImg = document.createElement("img");
+    newImg.alt = "camera stream";
+    newImg.style.objectFit = this._config.fit_mode;
+    this._bindImgEvents(newImg);
+    oldImg.parentNode.replaceChild(newImg, oldImg);
+    this._img = newImg;
   }
 
   _restart() {
     this._stop();
-    if (!this._connected || !this._hass || !this._config) {
-      return;
-    }
+    if (!this._connected || !this._hass || !this._config) return;
 
     this._running = true;
-    this._setState("loading", "connecting");
-    this._loadSnapshot();
-
-    const interval = Math.max(1, this._config.refresh_seconds) * 1000;
-    this._refreshTimer = setInterval(() => {
-      if (!this._running) {
-        return;
-      }
-      this._loadSnapshot();
-    }, interval);
+    this._setState("reconnecting", "connecting");
+    this._startStream();
   }
 
   _stop() {
     this._running = false;
+    clearTimeout(this._reconnectTimer);
+    clearInterval(this._watchdogTimer);
     clearInterval(this._refreshTimer);
+    this._reconnectTimer = null;
+    this._watchdogTimer = null;
     this._refreshTimer = null;
+    this._lastPixels = null;
+    this._frozenCount = 0;
     if (this._img) {
       this._img.removeAttribute("src");
     }
   }
 
-  _buildSnapshotUrl() {
+  _buildStreamUrl() {
     const state = this._hass.states[this._config.entity];
-    if (!state) {
-      return null;
-    }
+    if (!state) return null;
 
     const token = state.attributes && state.attributes.access_token;
-    // Use /api/camera_proxy (single JPEG snapshot) — works like picture-glance.
-    // Relative path ensures it works both locally and via HA Cloud / reverse proxy.
-    const path = "/api/camera_proxy/" + this._config.entity;
-    const ts = Date.now();
+    // camera_proxy_stream returns a continuous multipart/x-mixed-replace MJPEG
+    // stream — the browser renders it live, exactly like camera-page.js in the
+    // Node.js app. Relative path works both locally and via HA Cloud / reverse proxy.
+    const path = "/api/camera_proxy_stream/" + this._config.entity;
     if (!token) {
-      return path + "?ts=" + ts;
+      return path + "?ts=" + Date.now();
     }
     return (
       path +
       "?token=" + encodeURIComponent(token) +
-      "&ts=" + ts
+      "&ts=" + Date.now()
     );
   }
 
-  _loadSnapshot() {
-    if (!this._running) {
-      return;
-    }
+  _startStream() {
+    if (!this._running) return;
 
-    const url = this._buildSnapshotUrl();
+    const url = this._buildStreamUrl();
     if (!url) {
+      this._scheduleReconnect("missing token");
       return;
     }
 
+    this._setState("reconnecting", "connecting");
+
+    // Replace the element to force-close the old MJPEG TCP socket before
+    // opening a new connection — same pattern as camera-page.js (src = '').
+    this._replaceImageElement();
     this._img.src = url;
   }
 
-  _setState(mode, label) {
-    if (!this._statusEl) {
-      return;
-    }
+  // Canvas-based pixel watchdog — identical to the Node.js app implementation.
+  // Samples an 8x8 thumbnail every watchdog_interval seconds.
+  // If pixels don't change for frozen_checks consecutive checks, triggers reconnect.
+  _startWatchdog() {
+    clearInterval(this._watchdogTimer);
 
+    const canvas = document.createElement("canvas");
+    canvas.width = 8;
+    canvas.height = 8;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    this._lastPixels = null;
+    this._frozenCount = 0;
+
+    this._watchdogTimer = setInterval(() => {
+      if (!this._running) return;
+
+      try {
+        ctx.drawImage(this._img, 0, 0, 8, 8);
+        const pixels = ctx.getImageData(0, 0, 8, 8).data.join(",");
+
+        if (this._lastPixels !== null && pixels === this._lastPixels) {
+          this._frozenCount++;
+          if (this._frozenCount >= this._config.frozen_checks) {
+            clearInterval(this._watchdogTimer);
+            this._scheduleReconnect("watchdog: frozen frame");
+          }
+        } else {
+          this._frozenCount = 0;
+        }
+
+        this._lastPixels = pixels;
+      } catch (_) {
+        // cross-origin or element not painted yet — ignore
+      }
+    }, Math.max(1, this._config.watchdog_interval) * 1000);
+  }
+
+  // Force a reconnect before Tuya's RTSP token expires (~150 s).
+  _startPeriodicRefresh() {
+    clearInterval(this._refreshTimer);
+    this._refreshTimer = setInterval(() => {
+      if (!this._running) return;
+      this._scheduleReconnect("periodic refresh");
+    }, Math.max(30, this._config.refresh_seconds) * 1000);
+  }
+
+  _scheduleReconnect(reason) {
+    if (!this._running) return;
+
+    clearTimeout(this._reconnectTimer);
+    clearInterval(this._watchdogTimer);
+    clearInterval(this._refreshTimer);
+    this._watchdogTimer = null;
+    this._refreshTimer = null;
+
+    this._setState("reconnecting", "reconnecting");
+    console.debug("[tuya-camera-card] reconnect:", reason);
+
+    this._reconnectTimer = setTimeout(() => {
+      if (!this._running) return;
+      this._startStream();
+    }, Math.max(0, this._config.reconnect_delay) * 1000);
+  }
+
+  _setState(mode, label) {
+    if (!this._statusEl) return;
     this._statusEl.className = "status " + mode;
     this._statusEl.textContent = label;
   }
@@ -217,6 +303,6 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "tuya-reconnect-camera-card",
   name: "Tuya Reconnect Camera Card",
-  description: "Snapshot-based live camera card — refreshes every N seconds like picture-glance",
+  description: "Live MJPEG stream with canvas freeze-watchdog and auto-reconnect",
   preview: true,
 });
